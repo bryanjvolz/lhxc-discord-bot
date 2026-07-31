@@ -1,4 +1,5 @@
 import sqlite3
+import json
 
 DB_FILE = 'discord_bot.db'
 
@@ -28,9 +29,19 @@ def create_tables():
         CREATE TABLE IF NOT EXISTS server_configs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL UNIQUE,
-            notification_channel_id INTEGER
+            notification_channel_id INTEGER,
+            notification_mode TEXT DEFAULT 'periodic',
+            digest_time TEXT DEFAULT '08:00'
         )
     ''')
+
+    # Add columns if they don't exist (for migration purposes)
+    cursor.execute("PRAGMA table_info(server_configs)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'notification_mode' not in columns:
+        cursor.execute("ALTER TABLE server_configs ADD COLUMN notification_mode TEXT DEFAULT 'periodic'")
+    if 'digest_time' not in columns:
+        cursor.execute("ALTER TABLE server_configs ADD COLUMN digest_time TEXT DEFAULT '08:00'")
 
     # Create a table for posted events
     cursor.execute('''
@@ -49,6 +60,17 @@ def create_tables():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL UNIQUE,
             timezone TEXT
+        )
+    ''')
+
+    # Create a table for digest events
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS digest_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            event_data TEXT NOT NULL,
+            UNIQUE(guild_id, event_id)
         )
     ''')
 
@@ -161,6 +183,59 @@ def get_all_notification_channels():
     rows = cursor.fetchall()
     conn.close()
     return {row['guild_id']: row['notification_channel_id'] for row in rows}
+
+def set_notification_mode(guild_id, mode):
+    """Sets the notification mode for a server (periodic or digest)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO server_configs (guild_id, notification_mode) VALUES (?, ?)",
+                   (guild_id, mode))
+    conn.commit()
+    conn.close()
+
+def get_notification_settings(guild_id):
+    """Gets the notification settings (mode and digest time) for a server."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT notification_mode, digest_time FROM server_configs WHERE guild_id = ?", (guild_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else {'notification_mode': 'periodic', 'digest_time': '08:00'}
+
+def set_digest_time(guild_id, digest_time):
+    """Sets the daily digest time for a server."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO server_configs (guild_id, digest_time) VALUES (?, ?)",
+                   (guild_id, digest_time))
+    conn.commit()
+    conn.close()
+
+def add_digest_event(guild_id, event_id, event_data):
+    """Adds an event to the digest queue for a specific guild."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO digest_events (guild_id, event_id, event_data) VALUES (?, ?, ?)",
+                   (guild_id, event_id, json.dumps(event_data)))
+    conn.commit()
+    conn.close()
+
+def get_digest_events(guild_id):
+    """Retrieves all events in the digest queue for a specific guild."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT event_data FROM digest_events WHERE guild_id = ?", (guild_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [json.loads(row['event_data']) for row in rows]
+
+def clear_digest_events(guild_id):
+    """Clears all events from the digest queue for a specific guild."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM digest_events WHERE guild_id = ?", (guild_id,))
+    conn.commit()
+    conn.close()
 
 def clear_saved_events(user_id):
     """Clears all saved events for a user."""

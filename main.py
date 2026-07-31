@@ -19,6 +19,7 @@ load_dotenv(dotenv_path=dotenv_path)
 import scraper
 import database
 from datetime import date, timedelta, datetime, time
+from typing import List
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.ERROR, filename='discord-bot-errors.log', filemode='w', encoding='utf-8',
@@ -113,6 +114,37 @@ def format_event_date(date_str):
         suffix = ["st", "nd", "rd"][day % 10 - 1]
 
     return dt_obj.strftime(f'%B {day}{suffix}, %Y %-I:%M%p').lower()
+
+def format_digest_message(events):
+    if not events:
+        return None, None
+
+    first_event = events[0]
+    first_image_url = first_event.get('image_url')
+
+    embed = discord.Embed(
+        title="Daily Hardcore Digest",
+        description="Here are today's new and updated shows:",
+        color=discord.Color.red()
+    )
+
+    if first_image_url:
+        embed.set_thumbnail(url=first_image_url)
+
+    for event in events:
+        title_text = html.unescape(event.get('title') or 'No Title')
+        permalink = event.get('permalink', '#')
+        event_date = event.get('start_date')
+        venue = event.get('venue') or 'TBA'
+        event_id = event.get('id', 'N/A')
+
+        event_details = f"Date: {format_event_date(event_date) if event_date else 'N/A'}\n"
+        event_details += f"Venue: {venue}\n"
+        event_details += f"ID: {event_id}"
+
+        embed.add_field(name=f"[{title_text}]({permalink})", value=event_details, inline=False)
+
+    return embed
 
 def create_event_embed(event):
     description_html = event.get('description') or event.get('excerpt') or ''
@@ -261,6 +293,52 @@ async def set_notification_channel(interaction: discord.Interaction, channel: di
     database.set_notification_channel(interaction.guild.id, channel.id)
     await interaction.response.send_message(f"Notification channel set to {channel.mention}")
 
+admin_group = app_commands.Group(name="admin", description="Admin-only commands")
+bot.tree.add_command(admin_group)
+
+@admin_group.command(name="set-notification-config", description="Configure how new event notifications are sent.")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    mode="Choose notification mode: 'periodic' (immediate) or 'digest' (daily summary)",
+    time_str="(Optional) Time for daily digest (HH:MM in 24-hour, e.g., 08:00). Required for digest mode."
+)
+async def set_notification_config(
+    interaction: discord.Interaction,
+    mode: Literal['periodic', 'digest'],
+    time_str: str = None
+):
+    if mode == 'digest' and not time_str:
+        await interaction.response.send_message("Digest mode requires a time (HH:MM).", ephemeral=True)
+        return
+
+    if time_str:
+        try:
+            # Validate time_str format
+            datetime.strptime(time_str, '%H:%M')
+        except ValueError:
+            await interaction.response.send_message("Invalid time format. Please use HH:MM (e.g., 08:00).", ephemeral=True)
+            return
+        database.set_digest_time(interaction.guild.id, time_str)
+
+    database.set_notification_mode(interaction.guild.id, mode)
+
+    settings = database.get_notification_settings(interaction.guild.id)
+    await interaction.response.send_message(
+        f"Notification mode set to '{settings['notification_mode']}'. "
+        f"Digest time: {settings['digest_time'] if settings['notification_mode'] == 'digest' else 'N/A'}.",
+        ephemeral=True
+    )
+
+@admin_group.command(name="view-notification-config", description="View current new event notification settings.")
+@app_commands.checks.has_permissions(administrator=True)
+async def view_notification_config(interaction: discord.Interaction):
+    settings = database.get_notification_settings(interaction.guild.id)
+    await interaction.response.send_message(
+        f"Current Notification Mode: '{settings['notification_mode']}'\n"
+        f"Daily Digest Time: {settings['digest_time'] if settings['notification_mode'] == 'digest' else 'N/A'}",
+        ephemeral=True
+    )
+
 @bot.tree.command(name='create-server-event', description='Creates a server event from an event ID.')
 @app_commands.describe(event_id='The ID of the event to create a server event from')
 @app_commands.checks.has_permissions(administrator=True)
@@ -381,26 +459,35 @@ async def check_for_updates():
         if not channel:
             continue
 
+        settings = database.get_notification_settings(guild_id)
+        notification_mode = settings['notification_mode']
+
         for event in all_events:
             event_id = event['id']
             last_updated_from_api = event.get('modified_date', event['start_date'])
             last_posted = database.get_posted_event(event_id, guild_id)
 
             if not last_posted:
-                # New event, post it
-                embed = create_event_embed(event)
-                view = EventView(event_id)
-                await channel.send("New show just announced!", embed=embed, view=view)
-                database.add_posted_event(event_id, guild_id, last_updated_from_api)
+                # New event
+                if notification_mode == 'periodic':
+                    embed = create_event_embed(event)
+                    view = EventView(event_id)
+                    await channel.send("New show just announced!", embed=embed, view=view)
+                    database.add_posted_event(event_id, guild_id, last_updated_from_api)
+                elif notification_mode == 'digest':
+                    database.add_digest_event(guild_id, event_id, event)
             elif last_posted < last_updated_from_api:
-                # Event updated, post it
-                embed = create_event_embed(event)
-                view = EventView(event_id)
-                await channel.send("A show has been updated!", embed=embed, view=view)
-                database.add_posted_event(event_id, guild_id, last_updated_from_api)
+                # Event updated
+                if notification_mode == 'periodic':
+                    embed = create_event_embed(event)
+                    view = EventView(event_id)
+                    await channel.send("A show has been updated!", embed=embed, view=view)
+                    database.add_posted_event(event_id, guild_id, last_updated_from_api)
+                elif notification_mode == 'digest':
+                    database.add_digest_event(guild_id, event_id, event)
 
 notification_time = time(hour=8, minute=0, tzinfo=pytz.timezone('US/Eastern'))
-@tasks.loop(time=notification_time)
+@tasks.loop(hours=1)
 async def daily_notifications():
     """Sends daily notifications to users about their saved events."""
     all_user_ids = database.get_all_users_with_saved_events()
@@ -432,6 +519,29 @@ async def daily_notifications():
                     await user.send("You have a saved event today!", embed=embed)
                 except Exception as e:
                     logging.error(f"Error sending notification to user {user_id}: {e}", exc_info=True)
+
+    # --- Daily Digest Logic ---
+    eastern = pytz.timezone('US/Eastern')
+    now_eastern = datetime.now(eastern)
+    current_time_str = now_eastern.strftime('%H:%M')
+
+    # Get all guilds with notification channels configured
+    all_guild_notification_channels = database.get_all_notification_channels()
+    for guild_id, channel_id in all_guild_notification_channels.items():
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            continue
+
+        settings = database.get_notification_settings(guild_id)
+        if settings['notification_mode'] == 'digest' and settings['digest_time'] == current_time_str:
+            digest_events = database.get_digest_events(guild_id)
+            if digest_events:
+                try:
+                    digest_embed = format_digest_message(digest_events)
+                    await channel.send(embed=digest_embed)
+                    database.clear_digest_events(guild_id)
+                except Exception as e:
+                    logging.error(f"Error sending digest for guild {guild_id} to channel {channel_id}: {e}", exc_info=True)
 
 # --- Run Bot ---
 if __name__ == "__main__":
