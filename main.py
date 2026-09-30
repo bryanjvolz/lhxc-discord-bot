@@ -19,7 +19,7 @@ load_dotenv(dotenv_path=dotenv_path)
 import scraper
 import database
 from datetime import date, timedelta, datetime, time
-from typing import List
+from typing import List, Literal
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.ERROR, filename='discord-bot-errors.log', filemode='w', encoding='utf-8',
@@ -94,8 +94,10 @@ async def on_ready():
     bot.add_view(SavedEventView(event_id=None))
     bot.add_view(TimezoneView())
     await bot.tree.sync()
-    check_for_updates.start()
-    daily_notifications.start()
+    if not check_for_updates.is_running():
+        check_for_updates.start()
+    if not daily_notifications.is_running():
+        daily_notifications.start()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -117,7 +119,7 @@ def format_event_date(date_str):
 
 def format_digest_message(events):
     if not events:
-        return None, None
+        return None
 
     first_event = events[0]
     first_image_url = first_event.get('image_url')
@@ -145,6 +147,34 @@ def format_digest_message(events):
         embed.add_field(name=f"[{title_text}]({permalink})", value=event_details, inline=False)
 
     return embed
+
+
+def format_digest_text(events):
+    """Return a simple text-only digest: title, price, date, venue for each event."""
+    if not events:
+        return "No events to display."
+
+    lines = ["Daily Hardcore Digest:\n"]
+    for event in events:
+        title = html.unescape(event.get('title') or 'No Title')
+        price = event.get('cost') or 'TBA'
+        date_str = event.get('start_date') or 'N/A'
+        # Format date to a readable string if possible
+        try:
+            date_val = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+            date_formatted = date_val.strftime('%B %-d, %Y %-I:%M%p').lower()
+        except Exception:
+            date_formatted = date_str
+
+        venue = event.get('venue') or 'TBA'
+        if isinstance(venue, dict) and venue.get('name'):
+            venue_text = venue.get('name')
+        else:
+            venue_text = venue
+
+        lines.append(f"{title} — {price} — {date_formatted} — {venue_text}")
+
+    return "\n".join(lines)
 
 def create_event_embed(event):
     description_html = event.get('description') or event.get('excerpt') or ''
@@ -198,7 +228,7 @@ async def todays_shows(interaction: discord.Interaction):
 
 @bot.tree.command(name='this-weeks-shows', description="Displays all events for the current week (Monday to Sunday).")
 async def this_weeks_shows(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     eastern = pytz.timezone('US/Eastern')
     today = datetime.now(eastern).date()
     start_of_week = today - timedelta(days=today.weekday())
@@ -212,14 +242,26 @@ async def this_weeks_shows(interaction: discord.Interaction):
                 if start_of_week <= event_date <= end_of_week:
                     events_this_week.append(event)
 
-    if events_this_week:
-        await interaction.followup.send("This Week's Shows:")
+    if not events_this_week:
+        await interaction.followup.send("No shows found for this week.", ephemeral=True)
+        return
+
+    try:
+        dm_channel = interaction.user.dm_channel or await interaction.user.create_dm()
+        await dm_channel.send("This Week's Shows:")
+
         for event in events_this_week:
             embed = create_event_embed(event)
             view = EventView(event['id'])
-            await interaction.followup.send(embed=embed, view=view)
-    else:
-        await interaction.followup.send("No shows found for this week.")
+            await dm_channel.send(embed=embed, view=view)
+
+        await interaction.followup.send("I sent this week's shows to your DMs.", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error sending this week's shows DM to user {interaction.user.id}: {e}", exc_info=True)
+        await interaction.followup.send(
+            "I couldn't send you a DM. Please make sure your privacy settings allow DMs from this bot.",
+            ephemeral=True
+        )
 
 @bot.tree.command(name='list-shows-date', description="Lists all events on a specific date.")
 @app_commands.describe(date_str='The date to search for (YYYY-MM-DD)')
@@ -242,32 +284,75 @@ async def list_shows_date(interaction: discord.Interaction, date_str: str):
 @bot.tree.command(name='list-all-saved-shows', description="Shows you a list of all the events you have personally saved.")
 async def list_all_saved_shows(interaction: discord.Interaction):
     saved_event_ids = database.get_saved_events(interaction.user.id)
-    if saved_event_ids:
-        await interaction.response.send_message("Your saved shows:")
+    await interaction.response.defer(ephemeral=True)
+
+    if not saved_event_ids:
+        await interaction.followup.send("You have no saved shows.", ephemeral=True)
+        return
+
+    try:
+        dm_channel = interaction.user.dm_channel or await interaction.user.create_dm()
+        await dm_channel.send("Your saved shows:")
+
+        found_events = False
         for event_id in saved_event_ids:
             event = scraper.get_event_by_id(event_id)
             if event:
-                embed = create_event_embed(event[0])
-                view = SavedEventView(event[0]['id'])
-                await interaction.followup.send(embed=embed, view=view)
-    else:
-        await interaction.response.send_message("You have no saved shows.")
+                event = event[0]
+                embed = create_event_embed(event)
+                view = SavedEventView(event['id'])
+                await dm_channel.send(embed=embed, view=view)
+                found_events = True
+
+        if not found_events:
+            await dm_channel.send("No saved events could be retrieved from the API.")
+
+        await interaction.followup.send("I sent your saved shows to your DMs.", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error sending saved shows DM to user {interaction.user.id}: {e}", exc_info=True)
+        await interaction.followup.send(
+            "I couldn't send you a DM. Please make sure your privacy settings allow DMs from this bot.",
+            ephemeral=True
+        )
 
 @bot.tree.command(name='list-upcoming-saved-shows', description="Shows you a list of all your upcoming saved events.")
 async def list_upcoming_saved_shows(interaction: discord.Interaction):
     saved_event_ids = database.get_saved_events(interaction.user.id)
-    if saved_event_ids:
-        await interaction.response.send_message("Your upcoming saved shows:")
-        for event_id in saved_event_ids:
-            event = scraper.get_event_by_id(event_id)
-            if event:
-                event_date = datetime.strptime(event[0]['start_date'], '%Y-%m-%d %H:%M:%S').date()
-                if event_date >= date.today():
-                    embed = create_event_embed(event[0])
-                    view = SavedEventView(event[0]['id'])
-                    await interaction.followup.send(embed=embed, view=view)
-    else:
-        await interaction.response.send_message("You have no upcoming saved shows.")
+    await interaction.response.defer(ephemeral=True)
+
+    if not saved_event_ids:
+        await interaction.followup.send("You have no upcoming saved shows.", ephemeral=True)
+        return
+
+    upcoming_events = []
+    for event_id in saved_event_ids:
+        event = scraper.get_event_by_id(event_id)
+        if event:
+            event = event[0]
+            event_date = datetime.strptime(event['start_date'], '%Y-%m-%d %H:%M:%S').date()
+            if event_date >= date.today():
+                upcoming_events.append(event)
+
+    if not upcoming_events:
+        await interaction.followup.send("You have no upcoming saved shows.", ephemeral=True)
+        return
+
+    try:
+        dm_channel = interaction.user.dm_channel or await interaction.user.create_dm()
+        await dm_channel.send("Your upcoming saved shows:")
+
+        for event in upcoming_events:
+            embed = create_event_embed(event)
+            view = SavedEventView(event['id'])
+            await dm_channel.send(embed=embed, view=view)
+
+        await interaction.followup.send("I sent your upcoming saved shows to your DMs.", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error sending upcoming saved shows DM to user {interaction.user.id}: {e}", exc_info=True)
+        await interaction.followup.send(
+            "I couldn't send you a DM. Please make sure your privacy settings allow DMs from this bot.",
+            ephemeral=True
+        )
 
 
 @bot.tree.command(name='clear-saved', description="Removes all events from your personal saved list.")
@@ -296,7 +381,7 @@ async def set_notification_channel(interaction: discord.Interaction, channel: di
 admin_group = app_commands.Group(name="admin", description="Admin-only commands")
 bot.tree.add_command(admin_group)
 
-@admin_group.command(name="set-notification-config", description="Configure how new event notifications are sent.")
+@bot.tree.command(name='lhxc-admin-set-notifications', description="Configure how new event notifications are sent.")
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(
     mode="Choose notification mode: 'periodic' (immediate) or 'digest' (daily summary)",
@@ -514,9 +599,14 @@ async def daily_notifications():
             event_start_date = datetime.strptime(event['start_date'], '%Y-%m-%d %H:%M:%S').date()
 
             if event_start_date == now_in_user_tz.date():
+                notification_date = now_in_user_tz.date().isoformat()
+                if database.has_user_notification(user_id, event_id, notification_date):
+                    continue
+
                 try:
                     embed = create_event_embed(event)
                     await user.send("You have a saved event today!", embed=embed)
+                    database.add_user_notification(user_id, event_id, notification_date)
                 except Exception as e:
                     logging.error(f"Error sending notification to user {user_id}: {e}", exc_info=True)
 
@@ -537,8 +627,8 @@ async def daily_notifications():
             digest_events = database.get_digest_events(guild_id)
             if digest_events:
                 try:
-                    digest_embed = format_digest_message(digest_events)
-                    await channel.send(embed=digest_embed)
+                    digest_text = format_digest_text(digest_events)
+                    await channel.send(digest_text)
                     database.clear_digest_events(guild_id)
                 except Exception as e:
                     logging.error(f"Error sending digest for guild {guild_id} to channel {channel_id}: {e}", exc_info=True)

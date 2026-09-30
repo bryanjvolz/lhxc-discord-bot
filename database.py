@@ -74,6 +74,16 @@ def create_tables():
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            notification_date TEXT NOT NULL,
+            UNIQUE(user_id, event_id, notification_date)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -81,7 +91,8 @@ def set_notification_channel(guild_id, channel_id):
     """Sets the notification channel for a server."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO server_configs (guild_id, notification_channel_id) VALUES (?, ?)",
+    cursor.execute("INSERT INTO server_configs (guild_id, notification_channel_id) VALUES (?, ?) "
+                   "ON CONFLICT(guild_id) DO UPDATE SET notification_channel_id = excluded.notification_channel_id",
                    (guild_id, channel_id))
     conn.commit()
     conn.close()
@@ -140,6 +151,29 @@ def get_all_users_with_saved_events():
     conn.close()
     return [row['user_id'] for row in rows]
 
+def has_user_notification(user_id, event_id, notification_date):
+    """Checks whether a user notification was sent for an event on a date."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM user_notifications WHERE user_id = ? AND event_id = ? AND notification_date = ?",
+        (user_id, event_id, notification_date)
+    )
+    sent = cursor.fetchone() is not None
+    conn.close()
+    return sent
+
+def add_user_notification(user_id, event_id, notification_date):
+    """Records a successfully sent user notification."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR IGNORE INTO user_notifications (user_id, event_id, notification_date) VALUES (?, ?, ?)",
+        (user_id, event_id, notification_date)
+    )
+    conn.commit()
+    conn.close()
+
 def get_all_saved_events_with_users():
     """Gets all saved events with the users who saved them."""
     conn = get_db_connection()
@@ -188,7 +222,8 @@ def set_notification_mode(guild_id, mode):
     """Sets the notification mode for a server (periodic or digest)."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO server_configs (guild_id, notification_mode) VALUES (?, ?)",
+    cursor.execute("INSERT INTO server_configs (guild_id, notification_mode) VALUES (?, ?) "
+                   "ON CONFLICT(guild_id) DO UPDATE SET notification_mode = excluded.notification_mode",
                    (guild_id, mode))
     conn.commit()
     conn.close()
@@ -206,7 +241,8 @@ def set_digest_time(guild_id, digest_time):
     """Sets the daily digest time for a server."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO server_configs (guild_id, digest_time) VALUES (?, ?)",
+    cursor.execute("INSERT INTO server_configs (guild_id, digest_time) VALUES (?, ?) "
+                   "ON CONFLICT(guild_id) DO UPDATE SET digest_time = excluded.digest_time",
                    (guild_id, digest_time))
     conn.commit()
     conn.close()

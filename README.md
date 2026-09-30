@@ -58,6 +58,16 @@ These commands can only be used by server administrators.
 - **/view-all-saved-shows**
   - **Description**: Displays a list of all shows that have been saved by users, and which users have saved them.
 
+- **/lhxc-admin-set-notifications `mode` `time_str?`**
+  - **Description**: Configure how the bot posts new/updated shows for the server. `mode` must be either `periodic` (post each new/updated show as it is discovered) or `digest` (collect shows and post a single daily digest).
+  - **Options**:
+    - `mode`: `'periodic'` or `'digest'`
+    - `time_str` (optional): required when `mode` is `digest`; the daily digest time in `HH:MM` (24-hour) format, e.g. `08:00`.
+  - **Examples**:
+    - `/lhxc-admin-set-notifications periodic`
+    - `/lhxc-admin-set-notifications digest 08:00`
+  - **Notes**: When `digest` is selected the bot will send one plain-text digest message to the configured notification channel at the specified time. The digest format is simple text (no featured image) and lists each show as: `Title — Price — Date — Venue`.
+
 ## Setup and Running the Bot
 
 Follow these steps to set up and run the bot for the first time on a new server.

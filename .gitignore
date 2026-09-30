@@ -1,3 +1,4 @@
 .env
 discord-bot-errors.log
 __pycache__/
+.github/
